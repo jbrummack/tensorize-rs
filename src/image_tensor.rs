@@ -15,7 +15,7 @@ struct ResizeParams {
     output_height: u32,
 }
 
-pub struct ImageResizer {
+struct Tensorizer {
     device: Device,
     queue: Queue,
     compute_pipeline: ComputePipeline,
@@ -28,7 +28,7 @@ fn create_catmull_rom_shader(device: &wgpu::Device) -> ShaderModule {
     device.create_shader_module(include_wgsl!("resize_img.wgsl"))
 }
 
-impl ImageResizer {
+impl Tensorizer {
     pub async fn new(output_width: u32, output_height: u32) -> anyhow::Result<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let adapter = instance
@@ -105,7 +105,7 @@ impl ImageResizer {
             cache: None,
         });
 
-        Ok(ImageResizer {
+        Ok(Tensorizer {
             device,
             queue,
             bind_group_layout,
@@ -115,7 +115,7 @@ impl ImageResizer {
         })
     }
 
-    pub async fn rescale(&self, img: &DynamicImage, output_path: &str) -> anyhow::Result<()> {
+    pub async fn rescale(&self, img: &DynamicImage) -> anyhow::Result<DynamicImage> {
         let (input_width, input_height) = img.dimensions();
         let rgba_img = img.to_rgba8();
         let img_data = rgba_img.into_raw();
@@ -301,11 +301,13 @@ impl ImageResizer {
         )
         .unwrap();
 
-        output_image.save(output_path)?;
-        println!("Image resized and saved to {}", output_path);
+        /*output_image
+            .save(output_path)
+            .map_err(|e| format!("Failed to save output image: {}", e))?;
+        println!("Image resized and saved to {}", output_path);*/
 
         //            Ok(())
 
-        Ok(())
+        todo!()
     }
 }
