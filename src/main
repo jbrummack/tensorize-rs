@@ -1,17 +1,9 @@
-// Dependencies for Cargo.toml:
-// [dependencies]
-// wgpu = "0.17"
-// image = "0.24"
-// pollster = "0.3"
-// bytemuck = { version = "1.14", features = ["derive"] }
-// futures-intrusive = "0.5"
-
-use image::{DynamicImage, GenericImageView, ImageBuffer, Rgba};
+use anyhow::Ok;
+use bytemuck::{Pod, Zeroable};
+use image::RgbaImage;
 use std::num::NonZeroU32;
-use std::path::Path;
-use wgpu::{ShaderModule, include_wgsl, util::DeviceExt};
-
-pub mod image_resizer;
+use wgpu::include_wgsl;
+use wgpu::util::DeviceExt;
 
 // Define the parameters for resizing
 #[repr(C)]
@@ -23,74 +15,60 @@ struct ResizeParams {
     output_height: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ScaleUniform([f32; 2]);
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Load the image
-    let img_path = "image.png"; // Replace with your image path
-    let img = image::open(img_path).expect("Failed to open image");
+    println!("Hello, world!");
+    create_tensor().await?;
+    Ok(())
+}
+
+async fn create_tensor() -> anyhow::Result<()> {
+    let shader_cfg = include_wgsl!("tensor.wgsl");
+
+    let img = image::open("image.png")?.to_rgba8();
     let (input_width, input_height) = img.dimensions();
 
-    // Target dimensions
     let output_width = 224u32;
     let output_height = 224u32;
 
-    println!(
-        "Resizing image from {}x{} to {}x{}",
-        input_width, input_height, output_width, output_height
+    //let img_data = img.into_raw();
+
+    let instance = wgpu::Instance::default();
+    let adapter = instance.request_adapter(&Default::default()).await?;
+    let (device, queue) = adapter.request_device(&Default::default()).await?;
+    let shader = device.create_shader_module(shader_cfg);
+
+    let input_texture = device.create_texture_with_data(
+        &queue,
+        &wgpu::TextureDescriptor {
+            label: Some("Source texture"),
+            size: wgpu::Extent3d {
+                width: input_width,
+                height: input_height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        wgpu::wgt::TextureDataOrder::LayerMajor,
+        &img,
     );
 
-    // Convert image to RGBA format
-    let rgba_img = img.to_rgba8();
-    let img_data = rgba_img.into_raw();
-
-    // Initialize wgpu
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::default(),
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        })
-        .await?;
-
-    let (device, queue) = adapter
-        .request_device(&wgpu::DeviceDescriptor {
-            label: None,
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            memory_hints: wgpu::MemoryHints::Performance,
-            trace: wgpu::Trace::default(),
-        })
-        .await?;
-
-    // Create textures for input and output
-    let texture_size = wgpu::Extent3d {
-        width: input_width,
-        height: input_height,
-        depth_or_array_layers: 1,
-    };
-
-    let input_texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("Input Texture"),
-        size: texture_size,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-
-    // Create output texture
-    let output_texture_size = wgpu::Extent3d {
-        width: output_width,
-        height: output_height,
-        depth_or_array_layers: 1,
-    };
-
     let output_texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("Output Texture"),
-        size: output_texture_size,
+        label: Some("Destination texture"),
+        size: wgpu::Extent3d {
+            width: output_width,
+            height: output_height,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -98,16 +76,19 @@ async fn main() -> anyhow::Result<()> {
         usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
-
-    // Upload image data to the input texture
+    let texture_size = wgpu::Extent3d {
+        width: input_width,
+        height: input_height,
+        depth_or_array_layers: 1,
+    };
     queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
+        wgpu::TexelCopyTextureInfoBase {
             texture: &input_texture,
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        &img_data,
+        &img,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
             bytes_per_row: Some(NonZeroU32::new(4 * input_width).unwrap().into()),
@@ -123,26 +104,21 @@ async fn main() -> anyhow::Result<()> {
         output_width,
         output_height,
     };
+
     let resize_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Resize Parameters Buffer"),
         contents: bytemuck::cast_slice(&[resize_params]),
         usage: wgpu::BufferUsages::UNIFORM,
     });
-
-    // Create the compute shader
-    let shader = create_catmull_rom_shader(&device);
-
-    // Create bind group layout and bind group
     let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("Resize Bind Group Layout"),
         entries: &[
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
                     multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
                 },
                 count: None,
             },
@@ -167,34 +143,33 @@ async fn main() -> anyhow::Result<()> {
                 count: None,
             },
         ],
+        label: Some("Resize Bind Group Layout"),
     });
 
+    let src_view = input_texture.create_view(&Default::default());
+    let dst_view = output_texture.create_view(&Default::default());
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("Resize Bind Group"),
         layout: &bind_group_layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::TextureView(
-                    &input_texture.create_view(&wgpu::TextureViewDescriptor::default()),
-                ),
+                resource: wgpu::BindingResource::TextureView(&src_view),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::TextureView(
-                    &output_texture.create_view(&wgpu::TextureViewDescriptor::default()),
-                ),
+                resource: wgpu::BindingResource::TextureView(&dst_view),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: resize_params_buffer.as_entire_binding(),
             },
         ],
+        label: Some("Bind Group"),
     });
 
-    // Create pipeline layout and compute pipeline
+    // Pipeline
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("Resize Pipeline Layout"),
+        label: Some("Pipeline Layout"),
         bind_group_layouts: &[&bind_group_layout],
         push_constant_ranges: &[],
     });
@@ -222,81 +197,53 @@ async fn main() -> anyhow::Result<()> {
         compute_pass.set_bind_group(0, &bind_group, &[]);
         compute_pass.dispatch_workgroups((output_width + 15) / 16, (output_height + 15) / 16, 1);
     }
-
-    // Calculate bytes_per_row with proper alignment (256 bytes)
-    // wgpu requires bytes_per_row to be aligned to COPY_BYTES_PER_ROW_ALIGNMENT (256)
     let align = 256;
     let bytes_per_pixel = 4; // RGBA8 = 4 bytes per pixel
     let unpadded_bytes_per_row = output_width * bytes_per_pixel;
     let padding = (align - unpadded_bytes_per_row % align) % align;
     let padded_bytes_per_row = unpadded_bytes_per_row + padding;
 
-    // Create output buffer to retrieve the resized image data
-    let output_buffer_size = padded_bytes_per_row as u64 * output_height as u64;
+    // Read back
+    let buffer_size = padded_bytes_per_row as u64 * output_height as u64; //as wgpu::BufferAddress;
     let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Output Buffer"),
-        size: output_buffer_size,
+        size: buffer_size,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
+        label: Some("Output Buffer"),
     });
 
-    // Copy the output texture to the output buffer
     encoder.copy_texture_to_buffer(
-        wgpu::ImageCopyTexture {
+        wgpu::TexelCopyTextureInfoBase {
             texture: &output_texture,
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        wgpu::ImageCopyBuffer {
+        wgpu::TexelCopyBufferInfoBase {
             buffer: &output_buffer,
-            layout: wgpu::ImageDataLayout {
+            layout: wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(NonZeroU32::new(padded_bytes_per_row).unwrap().into()),
+                bytes_per_row: Some(NonZeroU32::new(output_width * 4).unwrap().into()),
                 rows_per_image: Some(NonZeroU32::new(output_height).unwrap().into()),
             },
         },
-        output_texture_size,
+        wgpu::Extent3d {
+            width: output_width,
+            height: output_height,
+            depth_or_array_layers: 1,
+        },
     );
 
-    queue.submit(std::iter::once(encoder.finish()));
+    queue.submit(Some(encoder.finish()));
 
-    // Read back the output buffer
+    // Read back and save
     let buffer_slice = output_buffer.slice(..);
-
-    buffer_slice.map_async(wgpu::MapMode::Read, move |_| {});
-
+    buffer_slice.map_async(wgpu::MapMode::Read, |_| {});
     device.poll(wgpu::PollType::Wait)?;
+    let data = buffer_slice.get_mapped_range().to_vec();
 
-    let data = buffer_slice.get_mapped_range();
-
-    // Create a new vector to unpad the rows
-    let mut result_rgba = Vec::with_capacity((output_width * output_height * 4) as usize);
-
-    // Copy each row, removing padding
-    for y in 0..output_height {
-        let row_start = (y as usize * padded_bytes_per_row as usize);
-        let row_end = row_start + (output_width as usize * 4);
-        result_rgba.extend_from_slice(&data.as_ref()[row_start..row_end]);
-    }
-
-    drop(data);
-    output_buffer.unmap();
-
-    // Save the output image
-    let output_image =
-        ImageBuffer::<Rgba<u8>, _>::from_raw(output_width, output_height, result_rgba)
-            .expect("Failed to create output image");
-
-    let output_path = "output_224x224.png";
-    output_image
-        .save(output_path)
-        .expect("Failed to save output image");
-    println!("Image resized and saved to {}", output_path);
+    let img = RgbaImage::from_raw(output_width, output_height, data).unwrap();
+    img.save("resized2.png").unwrap();
 
     Ok(())
-}
-
-fn create_catmull_rom_shader(device: &wgpu::Device) -> ShaderModule {
-    device.create_shader_module(include_wgsl!("tensor.wgsl"))
 }
