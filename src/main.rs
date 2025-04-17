@@ -10,8 +10,8 @@ async fn main() -> anyhow::Result<()> {
     resizer.rescale(&img, "rescaled.png").await?;
 
     let tensorizer = GpuTensorizer::new(IMAGENET_DEFAULT_CONFIG_NO_CROP).await?;
-    let _ = tensorizer.tensorize(&img).await?;
-    let gpu_tensor = tensorizer.tensorize(&img2).await?;
+    let _ = tensorizer.tensorize(&img2).await?;
+    let gpu_tensor = tensorizer.tensorize(&img).await?;
     println!("{gpu_tensor:?}");
 
     let cpu = CpuTensorizer::default_no_crop().await?;
