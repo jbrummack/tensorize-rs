@@ -1,6 +1,8 @@
 use image::DynamicImage;
 use ndarray::{Array3, Array4, Dim};
 
+use crate::tensorizer_trait::Tensorizer;
+
 pub const IMAGENET_DEFAULT_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 pub const IMAGENET_DEFAULT_STD: [f32; 3] = [0.229, 0.224, 0.225];
 pub const IMAGENET_DEFAULT_CONFIG: ImageConvert = ImageConvert {
@@ -34,9 +36,29 @@ pub struct ImageConvert {
     pub interpolation: image::imageops::FilterType,
 }
 
+pub struct CpuTensorizer {
+    conv: ImageConvert,
+}
+
+impl Tensorizer for CpuTensorizer {
+    type BuildType = CpuTensorizer;
+
+    async fn new(config: crate::cpu_tensor::ImageConvert) -> anyhow::Result<Self::BuildType> {
+        Ok(CpuTensorizer { conv: config })
+    }
+
+    async fn tensorize(&self, image: &DynamicImage) -> anyhow::Result<ndarray::Array3<f32>> {
+        self.conv.ort_value3(image)
+    }
+
+    async fn tensorize_batch(&self, image: &DynamicImage) -> anyhow::Result<ndarray::Array4<f32>> {
+        self.conv.ort_value(image)
+    }
+}
+
 impl ImageConvert {
     //#[cfg(feature = "ort")]
-    pub fn ort_value(&self, image: &DynamicImage) -> anyhow::Result<Array4<f32>> {
+    fn ort_value(&self, image: &DynamicImage) -> anyhow::Result<Array4<f32>> {
         let normalized_data = self.create_data(image);
         let tensor_shape: [usize; 4] = [
             1,
@@ -50,7 +72,7 @@ impl ImageConvert {
         Ok(input_array)
     }
 
-    pub fn ort_value3(&self, image: &DynamicImage) -> anyhow::Result<Array3<f32>> {
+    fn ort_value3(&self, image: &DynamicImage) -> anyhow::Result<Array3<f32>> {
         let normalized_data = self.create_data(image);
         let tensor_shape: [usize; 3] = [
             self.channels as usize,

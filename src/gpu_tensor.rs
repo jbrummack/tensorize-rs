@@ -1,11 +1,29 @@
 use std::num::NonZeroU32;
 
 use anyhow::Ok;
-use image::{DynamicImage, GenericImageView, ImageBuffer, Rgba};
-use ndarray::{Array3, Array4, ArrayView4};
+use image::{DynamicImage, GenericImageView};
+use ndarray::{Array3, Array4};
 use wgpu::{
     BindGroupLayout, ComputePipeline, Device, Queue, ShaderModule, include_wgsl, util::DeviceExt,
 };
+
+use crate::tensorizer_trait::Tensorizer;
+
+impl Tensorizer for GpuTensorizer {
+    type BuildType = GpuTensorizer;
+
+    async fn new(config: crate::cpu_tensor::ImageConvert) -> anyhow::Result<Self::BuildType> {
+        GpuTensorizer::new(config.width, config.height, None, config.mean, config.std).await
+    }
+
+    async fn tensorize(&self, image: &DynamicImage) -> anyhow::Result<ndarray::Array3<f32>> {
+        self.tensorize(image).await
+    }
+
+    async fn tensorize_batch(&self, image: &DynamicImage) -> anyhow::Result<ndarray::Array4<f32>> {
+        self.tensorize_with_batch(image).await
+    }
+}
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -18,13 +36,14 @@ struct TensorParams {
     avg: [f32; 4],
 }
 
-pub struct Tensorizer {
+pub struct GpuTensorizer {
     device: Device,
     queue: Queue,
     compute_pipeline: ComputePipeline,
     bind_group_layout: BindGroupLayout,
     output_width: u32,
     output_height: u32,
+    #[allow(unused)]
     crop: Option<u32>,
     mean: [f32; 3],
     avg: [f32; 3],
@@ -34,8 +53,8 @@ fn create_catmull_rom_shader(device: &wgpu::Device) -> ShaderModule {
     device.create_shader_module(include_wgsl!("im2tensor.wgsl"))
 }
 
-impl Tensorizer {
-    pub async fn new(
+impl GpuTensorizer {
+    async fn new(
         output_width: u32,
         output_height: u32,
         crop: Option<u32>,
@@ -116,7 +135,7 @@ impl Tensorizer {
             compilation_options: Default::default(),
             cache: None,
         });
-        Ok(Tensorizer {
+        Ok(GpuTensorizer {
             device,
             queue,
             bind_group_layout,
@@ -128,12 +147,12 @@ impl Tensorizer {
             avg,
         })
     }
-    pub async fn tensorize_with_batch(&self, img: &DynamicImage) -> anyhow::Result<Array4<f32>> {
+    async fn tensorize_with_batch(&self, img: &DynamicImage) -> anyhow::Result<Array4<f32>> {
         let a3 = self.tensorize(img).await?;
         let a4 = a3.insert_axis(ndarray::Axis(0));
         Ok(a4)
     }
-    pub async fn tensorize(&self, img: &DynamicImage) -> anyhow::Result<Array3<f32>> {
+    async fn tensorize(&self, img: &DynamicImage) -> anyhow::Result<Array3<f32>> {
         let (input_width, input_height) = img.dimensions();
         let rgba_img = img.to_rgba8();
         let img_data = rgba_img.into_raw();
@@ -298,7 +317,7 @@ impl Tensorizer {
 
         buffer_slice.map_async(wgpu::MapMode::Read, move |_| {});
 
-        self.device.poll(wgpu::PollType::Wait)?;
+        let _ = self.device.poll(wgpu::PollType::Wait)?;
 
         let data = buffer_slice.get_mapped_range();
         let mut tensor =
