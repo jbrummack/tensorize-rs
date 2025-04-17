@@ -273,9 +273,9 @@ impl ImageResizer {
         // Read back the output buffer
         let buffer_slice = output_buffer.slice(..);
 
-        buffer_slice.map_async(wgpu::MapMode::Read, move |v| {});
+        buffer_slice.map_async(wgpu::MapMode::Read, move |_| {});
 
-        self.device.poll(wgpu::PollType::Wait);
+        let _ = self.device.poll(wgpu::PollType::Wait);
 
         let data = buffer_slice.get_mapped_range();
 
@@ -285,7 +285,7 @@ impl ImageResizer {
 
         // Copy each row, removing padding
         for y in 0..self.output_height {
-            let row_start = (y as usize * padded_bytes_per_row as usize);
+            let row_start = y as usize * padded_bytes_per_row as usize;
             let row_end = row_start + (self.output_width as usize * 4);
             result_rgba.extend_from_slice(&data.as_ref()[row_start..row_end]);
         }
