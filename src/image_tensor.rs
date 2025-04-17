@@ -2,34 +2,46 @@ use std::num::NonZeroU32;
 
 use anyhow::Ok;
 use image::{DynamicImage, GenericImageView, ImageBuffer, Rgba};
+use ndarray::{Array3, Array4, ArrayView4};
 use wgpu::{
     BindGroupLayout, ComputePipeline, Device, Queue, ShaderModule, include_wgsl, util::DeviceExt,
 };
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct ResizeParams {
+struct TensorParams {
     input_width: u32,
     input_height: u32,
     output_width: u32,
     output_height: u32,
+    mean: [f32; 4],
+    avg: [f32; 4],
 }
 
-struct Tensorizer {
+pub struct Tensorizer {
     device: Device,
     queue: Queue,
     compute_pipeline: ComputePipeline,
     bind_group_layout: BindGroupLayout,
     output_width: u32,
     output_height: u32,
+    crop: Option<u32>,
+    mean: [f32; 3],
+    avg: [f32; 3],
 }
 
 fn create_catmull_rom_shader(device: &wgpu::Device) -> ShaderModule {
-    device.create_shader_module(include_wgsl!("resize_img.wgsl"))
+    device.create_shader_module(include_wgsl!("im2tensor.wgsl"))
 }
 
 impl Tensorizer {
-    pub async fn new(output_width: u32, output_height: u32) -> anyhow::Result<Self> {
+    pub async fn new(
+        output_width: u32,
+        output_height: u32,
+        crop: Option<u32>,
+        mean: [f32; 3],
+        avg: [f32; 3],
+    ) -> anyhow::Result<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -70,7 +82,7 @@ impl Tensorizer {
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::StorageTexture {
                         access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        format: wgpu::TextureFormat::Rgba32Float,
                         view_dimension: wgpu::TextureViewDimension::D2,
                     },
                     count: None,
@@ -104,7 +116,6 @@ impl Tensorizer {
             compilation_options: Default::default(),
             cache: None,
         });
-
         Ok(Tensorizer {
             device,
             queue,
@@ -112,10 +123,17 @@ impl Tensorizer {
             compute_pipeline,
             output_width,
             output_height,
+            crop,
+            mean,
+            avg,
         })
     }
-
-    pub async fn rescale(&self, img: &DynamicImage) -> anyhow::Result<DynamicImage> {
+    pub async fn tensorize_with_batch(&self, img: &DynamicImage) -> anyhow::Result<Array4<f32>> {
+        let a3 = self.tensorize(img).await?;
+        let a4 = a3.insert_axis(ndarray::Axis(0));
+        Ok(a4)
+    }
+    pub async fn tensorize(&self, img: &DynamicImage) -> anyhow::Result<Array3<f32>> {
         let (input_width, input_height) = img.dimensions();
         let rgba_img = img.to_rgba8();
         let img_data = rgba_img.into_raw();
@@ -150,7 +168,7 @@ impl Tensorizer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: wgpu::TextureFormat::Rgba32Float,
             usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
@@ -171,13 +189,18 @@ impl Tensorizer {
             },
             texture_size,
         );
-
+        let [r, g, b] = self.mean;
+        let mean = [r, g, b, 0.0];
+        let [r, g, b] = self.avg;
+        let avg = [r, g, b, 0.0];
         // Create the resize parameters buffer
-        let resize_params = ResizeParams {
+        let resize_params = TensorParams {
             input_width,
             input_height,
             output_width: self.output_width,
             output_height: self.output_height,
+            mean,
+            avg,
         };
 
         let resize_params_buffer =
@@ -235,7 +258,7 @@ impl Tensorizer {
 
         // Calculate bytes_per_row with proper alignment (256 bytes)
         let align = 256;
-        let bytes_per_pixel = 4; // RGBA8 = 4 bytes per pixel
+        let bytes_per_pixel = 16; // RGBAFloat32 = 16 bytes per pixel
         let unpadded_bytes_per_row = self.output_width * bytes_per_pixel;
         let padding = (align - unpadded_bytes_per_row % align) % align;
         let padded_bytes_per_row = unpadded_bytes_per_row + padding;
@@ -273,41 +296,51 @@ impl Tensorizer {
         // Read back the output buffer
         let buffer_slice = output_buffer.slice(..);
 
-        buffer_slice.map_async(wgpu::MapMode::Read, move |v| {});
+        buffer_slice.map_async(wgpu::MapMode::Read, move |_| {});
 
-        self.device.poll(wgpu::PollType::Wait);
+        self.device.poll(wgpu::PollType::Wait)?;
 
         let data = buffer_slice.get_mapped_range();
+        let mut tensor =
+            Array3::<f32>::zeros((3, self.output_height as usize, self.output_width as usize));
+        for y in 0..self.output_height as usize {
+            for x in 0..self.output_width as usize {
+                let row_start = y * padded_bytes_per_row as usize;
+                let pixel_start = row_start + (x * bytes_per_pixel as usize);
 
-        // Create a new vector to unpad the rows
-        let mut result_rgba =
-            Vec::with_capacity((self.output_width * self.output_height * 4) as usize);
+                // Read RGBA float values (each float is 4 bytes)
+                let r = f32::from_ne_bytes([
+                    data[pixel_start],
+                    data[pixel_start + 1],
+                    data[pixel_start + 2],
+                    data[pixel_start + 3],
+                ]);
 
-        // Copy each row, removing padding
-        for y in 0..self.output_height {
-            let row_start = (y as usize * padded_bytes_per_row as usize);
-            let row_end = row_start + (self.output_width as usize * 4);
-            result_rgba.extend_from_slice(&data.as_ref()[row_start..row_end]);
+                let g = f32::from_ne_bytes([
+                    data[pixel_start + 4],
+                    data[pixel_start + 5],
+                    data[pixel_start + 6],
+                    data[pixel_start + 7],
+                ]);
+
+                let b = f32::from_ne_bytes([
+                    data[pixel_start + 8],
+                    data[pixel_start + 9],
+                    data[pixel_start + 10],
+                    data[pixel_start + 11],
+                ]);
+
+                // Store in CHW format with ImageNet normalization
+                // ImageNet normalization: values are in [0,1] range
+                tensor[[0, y, x]] = r; // R channel
+                tensor[[1, y, x]] = g; // G channel
+                tensor[[2, y, x]] = b; // B channel
+            }
         }
 
         drop(data);
         output_buffer.unmap();
 
-        // Save the output image
-        let output_image = ImageBuffer::<Rgba<u8>, _>::from_raw(
-            self.output_width,
-            self.output_height,
-            result_rgba,
-        )
-        .unwrap();
-
-        /*output_image
-            .save(output_path)
-            .map_err(|e| format!("Failed to save output image: {}", e))?;
-        println!("Image resized and saved to {}", output_path);*/
-
-        //            Ok(())
-
-        todo!()
+        Ok(tensor)
     }
 }

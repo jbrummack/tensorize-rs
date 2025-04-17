@@ -1,7 +1,7 @@
 // catmull_rom.wgsl
 
 @group(0) @binding(0) var input_texture: texture_2d<f32>;
-@group(0) @binding(1) var output_texture: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(1) var output_texture: texture_storage_2d<rgba32float, write>;
 @group(0) @binding(2) var<uniform> params: Params;
 
 struct Params {
@@ -9,6 +9,8 @@ struct Params {
     input_height: u32,
     output_width: u32,
     output_height: u32,
+    mean: vec3<f32>,
+    avg: vec3<f32>,
 }
 
 // Catmull-Rom interpolation weight calculation
@@ -36,6 +38,20 @@ fn safe_sample(x: i32, y: i32) -> vec4<f32> {
 fn catmull_rom_1d(p0: vec4<f32>, p1: vec4<f32>, p2: vec4<f32>, p3: vec4<f32>, t: f32) -> vec4<f32> {
     let weights = catmull_rom_weight(t);
     return p0 * weights.x + p1 * weights.y + p2 * weights.z + p3 * weights.w;
+}
+
+fn normalize_old(color: vec4<f32>, mean: vec3<f32>, avg: vec3<f32>) -> vec4<f32> {
+    let r = (color.x - mean.x) / avg.x;
+    let g = (color.y - mean.y) / avg.y;
+    let b = (color.z - mean.z) / avg.z;
+    let a = color.w;
+
+    return vec4<f32>(r,g,b,a);
+}
+
+fn normalize(color: vec4<f32>, mean: vec3<f32>, avg: vec3<f32>) -> vec4<f32> {
+    let rgb = (color.xyz - mean) / avg;
+    return vec4<f32>(rgb, color.w);
 }
 
 // Bicubic Catmull-Rom interpolation
@@ -103,7 +119,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // Get the interpolated color using Catmull-Rom
     let color = bicubic_catmull_rom(input_pos);
-
+    let normalized = normalize(color, params.mean, params.avg);
     // Write the result to the output texture
-    textureStore(output_texture, vec2<i32>(global_id.xy), color);
+    textureStore(output_texture, vec2<i32>(global_id.xy), normalized);
+    //textureStore(output_texture, vec2<i32>(global_id.xy), color);
 }
