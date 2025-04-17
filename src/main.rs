@@ -1,11 +1,6 @@
-use cpu_tensor::{CpuTensorizer, IMAGENET_DEFAULT_CONFIG_NO_CROP};
-use gpu_tensor::GpuTensorizer;
-use image_resizer::ImageResizer;
-use tensorizer_trait::Tensorizer;
-pub mod cpu_tensor;
-pub mod gpu_tensor;
-pub mod image_resizer;
-pub mod tensorizer_trait;
+use tensorize_rs::{
+    CpuTensorizer, GpuTensorizer, IMAGENET_DEFAULT_CONFIG_NO_CROP, ImageResizer, Tensorizer,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
